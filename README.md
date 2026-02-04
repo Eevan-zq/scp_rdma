@@ -1,7 +1,7 @@
 # scp_rdma - SCP over RDMA
 
 ## 工具：基于 RDMA 的高性能文件传输工具。
-背景：在智算场景中，智算服务器之间通常由RDMA(RoCE、IB、iWarp)实现Scale Out通信，本项目的目的就是为了用RDMA协议栈完成跨服务器之间的文件/文件夹 的相互传递，在传输镜像以及模型权重等文件时能够更加迅速。、
+背景：在智算场景中，智算服务器之间通常由RDMA(RoCE、IB、iWARP)实现Scale Out通信，本项目的目的就是为了用RDMA协议栈完成跨服务器之间的文件/文件夹 的相互传递，在传输镜像以及模型权重等文件时能够更加迅速。
 
 ## 简介
 结合实际的使用场景，本项目使用OOB(Socket)作为RDMA建链的方式，使用控制消息CDC(Connection Data Control)来通知接收端已完成write写入：
@@ -33,7 +33,7 @@ meson setup build
 ninja -C build
 ```
 
-### 在模型路径下使用
+### 安装到默认路径
 如果不想安装到系统，默认编译生成到build路径下
 ```bash
 cd build
@@ -110,3 +110,14 @@ scp_rdma -r /home/test/file 192.168.1.100:  # 递归传输目录
 | `-o <dir>` | 接收文件输出目录 |
 | `-v` | 详细输出 |
 | `-h` | 显示帮助 |
+
+### 使用示例
+
+接收端：
+
+<img width="798" height="278" alt="cb5329d3b6844c7009992c13071533ed" src="https://github.com/user-attachments/assets/856dbc54-20c7-4d56-b552-f174b11d0607" />
+
+发送端：
+
+<img width="1147" height="238" alt="cd28eadd48795d9b84ea08b55586fd7e" src="https://github.com/user-attachments/assets/26d44e03-087b-4b7a-ac25-4f0c6f353619" />
+
