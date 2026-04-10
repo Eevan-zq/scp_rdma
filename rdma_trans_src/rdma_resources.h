@@ -58,65 +58,6 @@ typedef struct {
   rdma_sync_mode_t sync_mode; /* 同步模式: NONE/CDC/IMME */
 } config_t;
 
-/* - 用户想要发送数据，需要填充的数据，填充示例：
-
-    // 数据1：字符串
-    char data1[] = "First message: Hello from RDMA batch";
-    rdma_trans_sge_t sge1 = {
-        .buf = data1,
-        .buf_len = strlen(data1) + 1
-    };
-
-    // 数据2：二进制数据
-    struct batch_data {
-        int id;
-        float values[4];
-        char tag[16];
-    } data2 = {
-        .id = 1001,
-        .values = {1.1f, 2.2f, 3.3f, 4.4f},
-        .tag = "BATCH_TEST"
-    };
-    rdma_trans_sge_t sge2 = {
-        .buf = &data2,
-        .buf_len = sizeof(data2)
-    };
-
-    // 数据3：Scatter-Gather数据
-    char sg_part1[] = "[SG1] First segment";
-    char sg_part2[] = "[SG2] Second segment with more data";
-    char sg_part3[] = "[SG3] Final segment";
-
-    rdma_trans_sge_t sges3[3] = {
-        {.buf = sg_part1, .buf_len = strlen(sg_part1) + 1},
-        {.buf = sg_part2, .buf_len = strlen(sg_part2) + 1},
-        {.buf = sg_part3, .buf_len = strlen(sg_part3) + 1}
-    };
-
-    // WR1：单SGE文本消息
-    rdma_trans_wr_t wr1 = {
-        .op_type = RDMA_OP_WRITE,
-        .sges = &sge1,
-        .sge_count = 1,
-        .wr_len = sge1.buf_len
-    };
-
-    // WR2：单SGE二进制数据
-    rdma_trans_wr_t wr2 = {
-        .op_type = RDMA_OP_WRITE,
-        .sges = &sge2,
-        .sge_count = 1,
-        .wr_len = sge2.buf_len
-    };
-
-    // WR3：多SGE Scatter-Gather
-    rdma_trans_wr_t wr3 = {
-        .op_type = RDMA_OP_WRITE,
-        .sges = sges3,
-        .sge_count = 3,
-        .wr_len = sges3[0].buf_len + sges3[1].buf_len + sges3[2].buf_len
-    };
-*/
 typedef struct {
   void *buf;
   size_t buf_len;
@@ -129,6 +70,7 @@ typedef struct {
   int sge_count;           // - 一个mr所包含的sge的数量 -
   size_t wr_len;           // - 一个mr中所有sge的buff_len的长度 -
   uint32_t imm_data; // - 当 op_type == RDMA_OP_WRITE_WITH_IMM 时使用的立即数 -
+  uint64_t remote_offset; // - 远程地址偏移量（用于双缓冲 slot 定位）-
 
 } rdma_trans_wr_t; // - 这是给用户使用的，让其填写的想要传输的数据的内容 -
 

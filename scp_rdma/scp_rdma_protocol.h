@@ -16,10 +16,25 @@
 /* 最大路径长度 */
 #define SCP_MAX_PATH_LEN 4096
 
-/* 单次传输的最大数据块大小 (256MB) - 增大以提升大文件传输性能 */
-#define SCP_CHUNK_SIZE (256 * 1024 * 1024)
-/* 合并缓冲区大小：头信息 + 数据块 */
-#define SCP_COMBINED_CHUNK_SIZE (SCP_CHUNK_SIZE + 1024)
+/* 单次传输的最大数据块大小 - 增大以提升大文件传输性能 */
+#define SCP_CHUNK_SIZE (16 * 1024 * 1024)
+
+/* O_DIRECT 零拷贝 DMA 支持：slot 内数据区的对齐偏移
+ * 文件数据通过 O_DIRECT + pread() 直接 DMA 到 slot_base + SCP_DATA_OFFSET 处，
+ * 跳过 Page Cache，消除 CPU 拷贝。header 仍由 CPU 写入 slot_base 起始位置。
+ * RDMA 发送时用 2 个 SGE (header + data)，NIC scatter/gather 自动聚合。
+ */
+#define SCP_DATA_OFFSET 4096
+
+/* 合并缓冲区大小：header 区 (SCP_DATA_OFFSET) + 数据块 (SCP_CHUNK_SIZE)
+ * 必须为 4096 的倍数，确保双 slot 的数据区都能 4KB 对齐 */
+#define SCP_COMBINED_CHUNK_SIZE (SCP_CHUNK_SIZE + SCP_DATA_OFFSET)
+
+/* 多缓冲总大小：4个slot，用于流水线传输 */
+#define SCP_MULTI_BUFFER_SLOTS 4
+#define SCP_MULTI_BUFFER_TOTAL_SIZE                                            \
+  (SCP_COMBINED_CHUNK_SIZE * SCP_MULTI_BUFFER_SLOTS)
+#define SCP_DUAL_BUFFER_TOTAL_SIZE SCP_MULTI_BUFFER_TOTAL_SIZE /* 兼容旧名 */
 
 /* 协议魔数，用于验证数据包 */
 #define SCP_PROTOCOL_MAGIC 0x53435052 /* "SCPR" in ASCII */
@@ -172,3 +187,4 @@ static inline uint32_t scp_calc_checksum(const void *data, size_t len) {
 }
 
 #endif /* SCP_RDMA_PROTOCOL_H */
+

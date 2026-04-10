@@ -7,6 +7,8 @@
 #include <infiniband/verbs.h>
 #include <sys/time.h>
 
+#define RDMA_CDC_RECV_SLOTS 8
+
 /* - 建链时交换数据的结构体 - */
 // - 每个sge想要传输的数据 -
 struct cm_mr_data_t {
@@ -41,8 +43,19 @@ typedef struct {
   struct ibv_mr
       *cdc_mr; /* - msg的mr放在了rdma_trans_wr_t中，cdc的mr放在create_qp_res_t中
                   - */
+  rdma_cdc_t *cdc_send_buf; /* CDC发送缓冲，即使多个slot，也共用一个cdc_send_buf */
+  rdma_cdc_t **cdc_recv_bufs; // 多流水线，每个slot都需要一个cdc_receive_buf
+  int cdc_recv_slots;
+  int cdc_recv_post_idx;
+  int cdc_recv_cons_idx;
+  rdma_cdc_t *cdc_last_consumed;
 
   struct cm_con_data_ex_t *remote_props; // - 对端传输过来的的建链信息。
+
+  /* ========== 异步完成通知支持 ========== */
+  struct ibv_comp_channel *comp_channel; /* 完成事件通道 */
+  int epoll_fd;                          /* epoll 文件描述符 */
+  bool async_mode;                       /* 是否启用异步模式 */
 } create_qp_res_t;
 
 // void print_config(config_t* config);
@@ -64,6 +77,14 @@ int pd_create(create_qp_res_t *res);
 
 int cq_create(create_qp_res_t *res, int cq_size);
 
+/**
+ * 创建支持异步事件通知的 CQ
+ * @param res 资源结构
+ * @param cq_size CQ 大小
+ * @return 0 成功，非 0 失败
+ */
+int cq_create_async(create_qp_res_t *res, int cq_size);
+
 void qp_destroy(create_qp_res_t *res);
 
 void mr_destroy(rdma_trans_wr_t *msg);
@@ -71,6 +92,17 @@ void mr_destroy(rdma_trans_wr_t *msg);
 void pd_destroy(create_qp_res_t *res);
 
 void cq_destroy(create_qp_res_t *res);
+
+/**
+ * 等待并处理异步完成事件
+ * @param res 资源结构
+ * @param wc 输出的 WC 数组
+ * @param max_wc 最大 WC 数量
+ * @param timeout_ms 超时毫秒数 (-1 表示永久等待)
+ * @return 完成的 WC 数量，-1 表示错误
+ */
+int rdma_async_wait_completion(create_qp_res_t *res, struct ibv_wc *wc,
+                               int max_wc, int timeout_ms);
 
 /**
  * 释放RDMA资源
@@ -101,4 +133,8 @@ int rdma_trans_post(create_qp_res_t *qp_res, rdma_trans_wr_t *msg,
  */
 int rdma_trans_completion(create_qp_res_t *qp_res);
 
+rdma_cdc_t *rdma_cdc_acquire_post_buf(create_qp_res_t *res);
+rdma_cdc_t *rdma_cdc_consume_buf(create_qp_res_t *res);
+
 #endif
+

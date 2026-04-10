@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <byteswap.h>
 #include <endian.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <infiniband/verbs.h>
 #include <inttypes.h>
@@ -15,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -29,6 +32,27 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #else
 #error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
 #endif
+
+rdma_cdc_t *rdma_cdc_acquire_post_buf(create_qp_res_t *res) {
+  if (!res->cdc_recv_bufs || res->cdc_recv_slots == 0) {
+    return NULL;
+  }
+  rdma_cdc_t *buf = res->cdc_recv_bufs[res->cdc_recv_post_idx];
+  res->cdc_recv_post_idx =
+      (res->cdc_recv_post_idx + 1) % res->cdc_recv_slots;
+  return buf;
+}
+
+rdma_cdc_t *rdma_cdc_consume_buf(create_qp_res_t *res) {
+  if (!res->cdc_recv_bufs || res->cdc_recv_slots == 0) {
+    return NULL;
+  }
+  rdma_cdc_t *buf = res->cdc_recv_bufs[res->cdc_recv_cons_idx];
+  res->cdc_recv_cons_idx =
+      (res->cdc_recv_cons_idx + 1) % res->cdc_recv_slots;
+  res->cdc_last_consumed = buf;
+  return buf;
+}
 
 void sock_connect_exit(int listenfd, struct addrinfo *resolved_addr, int sockfd,
                        const char *servername) {
@@ -214,40 +238,38 @@ int sock_async_data(create_qp_res_t *res, rdma_trans_wr_t *msg,
 // - 后续是需要改进的，第一点是改成非阻塞的；第二点是 ibv_poll_cq(res->cq, 1,
 // &wc)改为ibv_poll_cq(res->cq, 10, wc)，前提是 struct ibv_wr wc[10];
 static int poll_completion(create_qp_res_t *res) {
-  struct ibv_wc wc[10];
+  struct ibv_wc wc;
   unsigned long start_time_msec;
   unsigned long cur_time_msec;
   struct timeval cur_time;
   int poll_result;
-  int i;
 
-  /* poll the completion for a while before giving up of doing it .. */
   gettimeofday(&cur_time, NULL);
   start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
 
   do {
-    /* 批量 Poll (size=10) 以快速清理积压的 SEND 信号 */
-    poll_result = ibv_poll_cq(res->cq, 10, wc);
+    /* 每次只 poll 1 个 WC，防止批量 poll 后 return 导致其余 WC 被丢弃。
+     * ibv_poll_cq 是破坏性读取，取出的 WC 不会再出现在 CQ 中。 */
+    poll_result = ibv_poll_cq(res->cq, 1, &wc);
 
     if (poll_result > 0) {
-      for (i = 0; i < poll_result; i++) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "got bad completion status: 0x%x, opcode: %d\n",
-                  wc[i].status, wc[i].opcode);
-          return 1;
-        }
-
-        /* 抓到任何发送相关的完成 (Write/Send/Read) 均视为本次同步请求的进展 */
-        if (wc[i].opcode == IBV_WC_RDMA_WRITE || wc[i].opcode == IBV_WC_SEND ||
-            wc[i].opcode == IBV_WC_RDMA_READ) {
-          return 0;
-        }
+      if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "got bad completion status: 0x%x, opcode: %d\n",
+                wc.status, wc.opcode);
+        return 1;
       }
+
+      /* 抓到发送相关的完成 (Write/Send/Read) 即视为本次同步请求完成 */
+      if (wc.opcode == IBV_WC_RDMA_WRITE || wc.opcode == IBV_WC_SEND ||
+          wc.opcode == IBV_WC_RDMA_READ) {
+        return 0;
+      }
+      /* 其他 opcode (如 IBV_WC_RECV) 不消费，继续轮询下一个 WC */
     }
 
     gettimeofday(&cur_time, NULL);
     cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-  } while (((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+  } while ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT);
 
   fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
   return 1;
@@ -301,7 +323,7 @@ static int post_send(create_qp_res_t *res, rdma_trans_wr_t *msg) {
   }
   sr.send_flags = IBV_SEND_SIGNALED;
   if (sr.opcode != IBV_WR_SEND) {
-    sr.wr.rdma.remote_addr = res->remote_props->mrs.addr;
+    sr.wr.rdma.remote_addr = res->remote_props->mrs.addr + msg->remote_offset;
     sr.wr.rdma.rkey = res->remote_props->mrs.rkey;
   }
 
@@ -357,6 +379,12 @@ static void resources_init(create_qp_res_t *res) {
   memset(res, 0, sizeof *res);
   res->sock = -1;
   res->cdc_mr = NULL;
+  res->cdc_send_buf = NULL;
+  res->cdc_recv_bufs = NULL;
+  res->cdc_recv_slots = 0;
+  res->cdc_recv_post_idx = 0;
+  res->cdc_recv_cons_idx = 0;
+  res->cdc_last_consumed = NULL;
 }
 
 void context_res_exit(create_qp_res_t *res, int rc,
@@ -477,6 +505,193 @@ void cq_destroy(create_qp_res_t *res) {
     }
     res->cq = NULL;
   }
+
+  /* 清理异步资源 */
+  if (res->epoll_fd >= 0) {
+    close(res->epoll_fd);
+    res->epoll_fd = -1;
+  }
+  if (res->comp_channel) {
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+  }
+}
+
+/**
+ * 创建支持异步事件通知的 CQ
+ * 包括 comp_channel 和 epoll 初始化
+ */
+int cq_create_async(create_qp_res_t *res, int cq_size) {
+  int rc = 0;
+
+  /* 初始化异步资源为无效值 */
+  res->epoll_fd = -1;
+  res->comp_channel = NULL;
+  res->async_mode = false;
+
+  /* 1. 创建完成事件通道 */
+  res->comp_channel = ibv_create_comp_channel(res->ib_ctx);
+  if (!res->comp_channel) {
+    fprintf(stderr, "cq_create_async: failed to create comp_channel\n");
+    return 1;
+  }
+
+  /* 2. 设置 comp_channel 为非阻塞 */
+  int flags = fcntl(res->comp_channel->fd, F_GETFL);
+  if (fcntl(res->comp_channel->fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    fprintf(stderr, "cq_create_async: failed to set non-blocking\n");
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+    return 1;
+  }
+
+  /* 3. 创建 CQ 并关联 comp_channel */
+  res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, res->comp_channel, 0);
+  if (!res->cq) {
+    fprintf(stderr, "cq_create_async: failed to create CQ with %d entries\n",
+            cq_size);
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+    return 1;
+  }
+
+  /* 4. 请求完成通知 */
+  if (ibv_req_notify_cq(res->cq, 0)) {
+    fprintf(stderr, "cq_create_async: failed to request CQ notification\n");
+    ibv_destroy_cq(res->cq);
+    res->cq = NULL;
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+    return 1;
+  }
+
+  /* 5. 创建 epoll 实例 */
+  res->epoll_fd = epoll_create1(0);
+  if (res->epoll_fd < 0) {
+    fprintf(stderr, "cq_create_async: failed to create epoll\n");
+    ibv_destroy_cq(res->cq);
+    res->cq = NULL;
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+    return 1;
+  }
+
+  /* 6. 将 comp_channel fd 加入 epoll */
+  struct epoll_event ev;
+  ev.events = EPOLLIN;
+  ev.data.fd = res->comp_channel->fd;
+  if (epoll_ctl(res->epoll_fd, EPOLL_CTL_ADD, res->comp_channel->fd, &ev) < 0) {
+    fprintf(stderr, "cq_create_async: failed to add to epoll\n");
+    close(res->epoll_fd);
+    res->epoll_fd = -1;
+    ibv_destroy_cq(res->cq);
+    res->cq = NULL;
+    ibv_destroy_comp_channel(res->comp_channel);
+    res->comp_channel = NULL;
+    return 1;
+  }
+
+  res->async_mode = true;
+  fprintf(stdout, "cq_create_async: created async CQ with epoll\n");
+  return rc;
+}
+
+/**
+ * 等待并处理异步完成事件
+ *
+ * 关键设计：必须确保 ibv_req_notify_cq 在任何 epoll_wait 之前被重新 arm，
+ * 且排空 comp_channel 上所有残留事件（可能由同步路径 poll_completion /
+ * rdma_cdc_completion 遗留）。否则 4-pipeline 下会因通知未 arm 而永久阻塞。
+ *
+ * @return 完成的 WC 数量，-1 表示错误
+ */
+int rdma_async_wait_completion(create_qp_res_t *res, struct ibv_wc *wc,
+                               int max_wc, int timeout_ms) {
+  struct epoll_event events[1];
+
+  /* 1. 先尝试非阻塞收割已有的 WC */
+  int ne = ibv_poll_cq(res->cq, max_wc, wc);
+  if (ne > 0) {
+    return ne;
+  }
+  if (ne < 0) {
+    fprintf(stderr, "rdma_async_wait_completion: poll_cq error\n");
+    return -1;
+  }
+
+  /* 2. CQ 为空 —— 排空 comp_channel 上所有残留事件
+   * 同步路径 (poll_completion / rdma_cdc_completion) 会直接调用 ibv_poll_cq
+   * 消耗 WC，但不会调用 ibv_get_cq_event 消费 comp_channel 上的通知事件，
+   * 也不会重新 arm ibv_req_notify_cq。这会导致：
+   *   - comp_channel 上有 stale 事件残留
+   *   - ibv_req_notify_cq 未 arm，新 WC 不会触发事件
+   * 必须先排空再 re-arm，否则 epoll_wait 会永久阻塞。 */
+  {
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    int drained = 0;
+    /* 非阻塞排空所有 stale 事件 (comp_channel fd 已设为 O_NONBLOCK) */
+    while (ibv_get_cq_event(res->comp_channel, &ev_cq, &ev_ctx) == 0) {
+      drained++;
+    }
+    if (drained > 0) {
+      ibv_ack_cq_events(res->cq, drained);
+    }
+  }
+
+  /* 3. 重新 arm 通知 —— 必须在 epoll_wait 之前 */
+  if (ibv_req_notify_cq(res->cq, 0)) {
+    fprintf(stderr, "rdma_async_wait_completion: req_notify error\n");
+    return -1;
+  }
+
+  /* 4. re-arm 之后再 poll 一次，捕获 arm 之前到达的 WC (标准模式) */
+  ne = ibv_poll_cq(res->cq, max_wc, wc);
+  if (ne > 0) {
+    return ne;
+  }
+  if (ne < 0) {
+    fprintf(stderr, "rdma_async_wait_completion: poll_cq error after rearm\n");
+    return -1;
+  }
+
+  /* 5. CQ 仍为空，安全等待 epoll 事件 (通知已 arm) */
+  int n = epoll_wait(res->epoll_fd, events, 1, timeout_ms);
+  if (n < 0) {
+    if (errno == EINTR) {
+      return 0;
+    }
+    fprintf(stderr, "rdma_async_wait_completion: epoll_wait error\n");
+    return -1;
+  }
+  if (n == 0) {
+    return 0; /* 超时 */
+  }
+
+  /* 6. 有事件，获取并确认 */
+  {
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    if (ibv_get_cq_event(res->comp_channel, &ev_cq, &ev_ctx)) {
+      fprintf(stderr, "rdma_async_wait_completion: get_cq_event error\n");
+      return -1;
+    }
+    ibv_ack_cq_events(ev_cq, 1);
+  }
+
+  /* 7. 重新 arm + 批量收割 */
+  if (ibv_req_notify_cq(res->cq, 0)) {
+    fprintf(stderr, "rdma_async_wait_completion: req_notify error\n");
+    return -1;
+  }
+
+  ne = ibv_poll_cq(res->cq, max_wc, wc);
+  if (ne < 0) {
+    fprintf(stderr, "rdma_async_wait_completion: poll_cq error after event\n");
+    return -1;
+  }
+
+  return ne;
 }
 
 // -
@@ -553,9 +768,15 @@ int mr_create(create_qp_res_t *res, rdma_trans_wr_t *msg) {
 
   /* - 注册rdma_cdc的mr (仅当尚未注册时) - */
   if (!res->cdc_mr) {
-    rdma_cdc_t *cdc = (rdma_cdc_t *)malloc(sizeof(rdma_cdc_t));
-    memset(cdc, 0, sizeof(rdma_cdc_t));
-    res->cdc_mr = ibv_reg_mr(res->pd, cdc, sizeof(rdma_cdc_t),
+    int slots = RDMA_CDC_RECV_SLOTS;
+    rdma_cdc_t *cdc =
+        (rdma_cdc_t *)calloc(slots + 1, sizeof(rdma_cdc_t));
+    if (!cdc) {
+      fprintf(stderr, "CDC: Failed to allocate CDC buffers\n");
+      return 1;
+    }
+    size_t total_size = sizeof(rdma_cdc_t) * (slots + 1);
+    res->cdc_mr = ibv_reg_mr(res->pd, cdc, total_size,
                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                                  IBV_ACCESS_REMOTE_WRITE);
     if (!res->cdc_mr) {
@@ -563,6 +784,23 @@ int mr_create(create_qp_res_t *res, rdma_trans_wr_t *msg) {
       free(cdc);
       return 1;
     }
+    res->cdc_recv_slots = slots;
+    res->cdc_recv_bufs =
+        (rdma_cdc_t **)malloc(sizeof(rdma_cdc_t *) * slots);
+    if (!res->cdc_recv_bufs) {
+      fprintf(stderr, "CDC: Failed to allocate recv buffer table\n");
+      ibv_dereg_mr(res->cdc_mr);
+      res->cdc_mr = NULL;
+      free(cdc);
+      return 1;
+    }
+    for (int idx = 0; idx < slots; ++idx) {
+      res->cdc_recv_bufs[idx] = cdc + idx;
+    }
+    res->cdc_send_buf = cdc + slots;
+    res->cdc_recv_post_idx = 0;
+    res->cdc_recv_cons_idx = 0;
+    res->cdc_last_consumed = res->cdc_recv_bufs[0];
   }
 
   return rc;
@@ -599,6 +837,8 @@ int qp_create(create_qp_res_t *res, int max_send_wr, int max_recv_wr,
   qp_init_attr.cap.max_recv_wr = max_recv_wr;
   qp_init_attr.cap.max_send_sge = max_send_sge;
   qp_init_attr.cap.max_recv_sge = max_recv_sge;
+  qp_init_attr.cap.max_inline_data =
+      64; /* 支持 IBV_SEND_INLINE (CDC 仅 ~16B) */
   res->qp = ibv_create_qp(res->pd, &qp_init_attr);
   if (!res->qp) {
     fprintf(stderr, "failed to create QP\n");
@@ -654,9 +894,9 @@ static int modify_qp_to_rtr(struct ibv_qp *qp, uint32_t remote_qpn,
 
   attr.qp_state = IBV_QPS_RTR;
   attr.path_mtu =
-      IBV_MTU_256; // -
-                   // 还有IBV_MTU_256、IBV_MTU_512、IBV_MTU_1024、IBV_MTU_2048、IBV_MTU_4096
-                   // -
+      IBV_MTU_4096; // -
+                    // 还有IBV_MTU_256、IBV_MTU_512、IBV_MTU_1024、IBV_MTU_2048、IBV_MTU_4096
+                    // -
   attr.dest_qp_num = remote_qpn;
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = 1;
@@ -771,7 +1011,8 @@ static int connect_qp(create_qp_res_t *res, rdma_trans_wr_t *msg,
 
     /* - 根据 sync_mode post 对应的 receive - */
     if (config->sync_mode == RDMA_SYNC_CDC) {
-      rc = post_receive_cdc(res->cdc_mr->addr, res->qp, res->cdc_mr);
+      rdma_cdc_t *buf = rdma_cdc_acquire_post_buf(res);
+      rc = post_receive_cdc(buf, res->qp, res->cdc_mr);
       if (rc) {
         fprintf(stderr, "in connect qp: post_receive_cdc failed\n");
         return rc;
@@ -855,6 +1096,15 @@ void rdma_trans_destroy(create_qp_res_t *res, rdma_trans_wr_t *msg,
     void *cdc_buffer = (void *)(uintptr_t)res->cdc_mr->addr;
     ibv_dereg_mr(res->cdc_mr);
     res->cdc_mr = NULL;
+    res->cdc_send_buf = NULL;
+    if (res->cdc_recv_bufs) {
+      free(res->cdc_recv_bufs);
+      res->cdc_recv_bufs = NULL;
+    }
+    res->cdc_recv_slots = 0;
+    res->cdc_recv_post_idx = 0;
+    res->cdc_recv_cons_idx = 0;
+    res->cdc_last_consumed = NULL;
     if (cdc_buffer) {
       free(cdc_buffer);
     }
@@ -1004,3 +1254,4 @@ int rdma_trans_completion(create_qp_res_t *res) {
   }
   return rc;
 }
+

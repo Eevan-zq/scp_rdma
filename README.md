@@ -1,4 +1,4 @@
-# scp_rdma - SCP over RDMA
+﻿# scp_rdma - SCP over RDMA
 
 ## 工具：基于 RDMA 的高性能文件传输工具。
 背景：在智算场景中，智算服务器之间通常由RDMA(RoCE、IB、iWARP)实现Scale Out通信，本项目的目的就是为了用RDMA协议栈完成跨服务器之间的文件/文件夹 的相互传递，在传输镜像以及模型权重等文件时能够更加迅速。
@@ -120,4 +120,72 @@ scp_rdma -r /home/test/file 192.168.1.100:  # 递归传输目录
 发送端：
 
 <img width="1147" height="238" alt="cd28eadd48795d9b84ea08b55586fd7e" src="https://github.com/user-attachments/assets/26d44e03-087b-4b7a-ac25-4f0c6f353619" />
+
+## 新增技术
+在保持整体使用方式不变的前提下，本版本新增了面向大文件与高并发场景的性能优化与稳定性增强：
+- 异步完成通知：CQ 绑定 comp_channel + epoll，事件驱动收割 completion，避免忙轮询。
+- 4-slot 多缓冲流水线：单次会话预分配 4 个数据槽位并复用 MR，提升吞吐并减少频繁分配。
+- CDC 信号增强：使用 slot_id + credits 进行 ACK 与流控，降低发送端阻塞概率。
+- O_DIRECT 零拷贝优化：4KB 对齐缓冲区配合直接 I/O，失败自动回退到普通读，兼顾性能与兼容性。
+- 持久会话与资源复用：首次握手完成后复用缓冲区与连接，减少多文件传输的初始化开销。
+
+### 技术示意图
+```mermaid
+sequenceDiagram
+  participant S as 发送端(Sender)
+  participant R as 接收端(Receiver)
+  participant CQ as comp_channel + epoll
+
+  Note over S,R: 阶段0：TCP 交换 QPN/RKey/Len，建立 RDMA 连接
+  Note over S: 预分配 4 个 slot（4-slot pipeline），每个 slot = 4KB 头 + 16MB 数据
+  Note over R: 预先 post 多个 CDC RECV，形成 credits 窗口
+
+  loop 每个数据块/控制消息
+    Note over S: 步骤1：选择空闲 slot[i]（如无空闲则等待 ACK）
+    S->>R: 步骤2：RDMA Write 将 header+data 写入 slot[i]
+    CQ-->>S: 步骤3：CQ 事件(Write completion)
+    S->>R: 步骤4：发送 CDC Data Ready(slot_id=i, credits)
+
+    Note over R: 步骤5：根据 slot_id 定位数据，解析协议头/数据
+    R->>R: 步骤6：写文件/建目录/更新进度
+    R->>S: 步骤7：发送 ACK + 更新 credits
+    CQ-->>S: 步骤8：CQ 事件(RECV ACK)
+
+    Note over S: 步骤9：释放 slot[i]，继续下一块
+  end
+```
+
+### 4-slot 流水线示意
+```mermaid
+flowchart LR
+  subgraph Time[时间 →]
+    T0[批次 n] --> T1[批次 n+1] --> T2[批次 n+2] --> T3[批次 n+3]
+  end
+
+  subgraph Slots[4 个 slot 轮转]
+    S0[slot0] --> S1[slot1] --> S2[slot2] --> S3[slot3] --> S0
+  end
+
+  subgraph Pipeline[流水线并行（slot 可乱序完成）]
+
+    S0W[slot0: RDMA Write] --> S0C[slot0: 发送 CDC] --> S1W[slot1: RDMA Write] --> S1C[slot1: 发送 CDC] --> S0A[slot0: 接收 ACK(释放slot0)] ...（接下一行）
+        --> S2W[slot2: RDMA Write] --> S2C[slot2: 发送 CDC] --> S1A[slot1: 接收 ACK(释放slot1)] --> S3W[slot3: RDMA Write] --> S3C[slot3: 发送 CDC]...(接下一行)
+        --> S0W[slot0: RDMA Write] --> S0C[slot0: 发送 CDC] --> S2A[slot2: 接收 ACK(释放slot2)] --> S3A[slot3: 接收 ACK(释放slot3)] ... 
+
+  end
+
+  S0W 表示 slot0的write操作
+  S0C 表示 slot0发送CDC的动作
+  S0A 表示 slot0接受ACK的动作
+
+  -. 异步推进：CDC 后不等待 ACK，直接切换下一个 slot .- S1W，只有ACK回来后才会释放slot进行下一次write传输，如果slot没被释放，跳过当前slot查看下一个slot是否可用 - 
+```
+
+补充说明：
+- 流水线深度：3 段（`RDMA Write` → `CDC Data Ready` → `ACK`）。
+- 流水线长度：4 个 slot（`slot0~slot3`），稳态时最多 4 个数据块在途。
+- 单个 slot 结构：4KB 头部 + 16MB 数据块（`SCP_DATA_OFFSET=4096`，`SCP_CHUNK_SIZE=16MB`）。
+- 吞吐行为：进入稳态后，每收到 1 个 ACK 释放 1 个 slot，发送端即可复用该 slot 继续写下一块。
+- 流控细节：`credits` 控制可发送的 CDC 数量，防止接收端 RECV 队列耗尽导致阻塞。
+- 异步特征：每个 slot 在完成 `CDC Data Ready` 后**不等待 ACK**，立即切换到下一个空闲 slot 继续写；ACK 到达时再异步释放对应 slot。
 

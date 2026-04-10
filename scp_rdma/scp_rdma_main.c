@@ -9,6 +9,12 @@
 #include <string.h>
 #include <time.h>
 
+static double timespec_diff_sec(const struct timespec *start,
+                                const struct timespec *end) {
+  return (double)(end->tv_sec - start->tv_sec) +
+         (double)(end->tv_nsec - start->tv_nsec) / 1e9;
+}
+
 void scp_rdma_default_config(scp_rdma_config_t *cfg) {
   memset(cfg, 0, sizeof(scp_rdma_config_t));
   cfg->dev_name = SCP_DEFAULT_DEV_NAME;
@@ -18,16 +24,18 @@ void scp_rdma_default_config(scp_rdma_config_t *cfg) {
   cfg->recursive = false;
   cfg->verbose = true;
   cfg->is_server = false;
+  cfg->no_link = false; /* 默认：lstat (保留软连接) */
   cfg->progress_cb = scp_default_progress;
 }
 
 void scp_default_progress(const char *filename, uint64_t transferred,
                           uint64_t total) {
   float percent = (total > 0) ? (float)transferred * 100 / total : 0;
-  printf("\rProgress: [%-50s] %.1f%% (%lu/%lu bytes) %s",
+  printf("\rProgress: [%-50s] %.1f%% (%llu/%llu bytes) %s",
          "==================================================" +
              (50 - (int)(percent / 2)),
-         percent, transferred, total, filename);
+         percent, (unsigned long long)transferred, (unsigned long long)total,
+         filename);
   if (transferred >= total)
     printf("\n");
   fflush(stdout);
@@ -45,18 +53,23 @@ static void print_usage(const char *progname) {
   printf("  -v          Verbose output\n");
   printf("  -h          Show this help\n\n");
   printf("Client Mode Options:\n");
-  printf("  -r          Recursive directory transfer\n\n");
+  printf("  -r          Recursive directory transfer\n");
+  printf("  -n          Follow symlinks (transfer target file instead of "
+         "link)\n\n");
   printf("Server Mode Options:\n");
   printf("  -s          Run in server mode\n");
   printf("  -o <dir>    Output directory for received files\n\n");
 }
 
 int main(int argc, char *argv[]) {
+  struct timespec app_start;
+  clock_gettime(CLOCK_MONOTONIC, &app_start);
+
   scp_rdma_config_t cfg;
   scp_rdma_default_config(&cfg);
 
   int opt;
-  while ((opt = getopt(argc, argv, "d:p:i:g:vhsro:")) != -1) {
+  while ((opt = getopt(argc, argv, "d:p:i:g:vhsro:nl")) != -1) {
     switch (opt) {
     case 'd':
       cfg.dev_name = optarg;
@@ -82,6 +95,10 @@ int main(int argc, char *argv[]) {
     case 'o':
       cfg.output_dir = optarg;
       break;
+    case 'n':
+    case 'l':
+      cfg.no_link = true;
+      break;
     case 'h':
       print_usage(argv[0]);
       return 0;
@@ -98,6 +115,12 @@ int main(int argc, char *argv[]) {
       return 1;
     scp_receiver_run(&ctx, NULL);
     scp_rdma_destroy(&ctx);
+    {
+      struct timespec app_end;
+      clock_gettime(CLOCK_MONOTONIC, &app_end);
+      printf("Total wall time (from start): %.2f seconds.\n",
+             timespec_diff_sec(&app_start, &app_end));
+    }
   } else {
     if (optind + 1 >= argc) {
       fprintf(stderr,
@@ -143,19 +166,30 @@ int main(int argc, char *argv[]) {
 
     printf("Starting transfer from %s to %s:%s\n", local_path, cfg.server_addr,
            final_remote_path);
-    clock_t start = clock();
+    struct timespec start_ts;
+    struct timespec end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
 
     if (scp_sender_run(&ctx, local_path, final_remote_path, NULL) == 0) {
-      clock_t end = clock();
-      double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+      clock_gettime(CLOCK_MONOTONIC, &end_ts);
+      double elapsed = (double)(end_ts.tv_sec - start_ts.tv_sec) +
+                       (double)(end_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
       printf("\nTransmission finished in %.2f seconds.\n", elapsed);
-      printf("Total Files: %u, Total Dirs: %u, Total Data: %lu bytes\n",
-             ctx.total_files, ctx.total_dirs, ctx.total_bytes);
+      printf("Total Files: %u, Total Dirs: %u, Total Symlinks: %u, Total Data: "
+             "%llu bytes\n",
+             ctx.total_files, ctx.total_dirs, ctx.total_symlinks,
+             (unsigned long long)ctx.total_bytes);
     } else {
       fprintf(stderr, "\nTransmission failed!\n");
     }
 
     scp_rdma_destroy(&ctx);
+    {
+      struct timespec app_end;
+      clock_gettime(CLOCK_MONOTONIC, &app_end);
+      printf("Total wall time (from start): %.2f seconds.\n",
+             timespec_diff_sec(&app_start, &app_end));
+    }
   }
 
   return 0;
